@@ -43,6 +43,81 @@ enum GeneratorType {
   GenKiss99
 };
 
+// fast bounded integer generation given a generator
+template <typename GenType>
+DI void uniformInt_bounded_64(uint64_t& ret, uint64_t bound, GenType gen)
+{
+  // this closely follows the implementation from here:
+  // https://github.com/apple/swift/pull/39143 using 64-bit unsigned
+  uint64_t rand;
+  gen.next(rand);
+  uint64_t result, fraction;
+  asm("mul.hi.u64 %0, %1, %2;" : "=l"(result) : "l"(rand), "l"(bound));
+  asm("mul.lo.u64 %0, %1, %2;" : "=l"(fraction) : "l"(rand), "l"(bound));
+  // we want this underflow
+  if (fraction <= uint64_t(0) - bound) {
+    ret = uint64_t(result);
+    return;
+  }
+
+  gen.next(rand);
+  // we only calculate the high bits here, since we assume that
+  // bitwidth of output is same as bit-width of random number stream
+  uint64_t phi;
+  asm("mul.hi.u64 %0, %1, %2;" : "=l"(phi) : "l"(rand), "l"(bound));
+  // overflow occurs precisely when addition is smaller than max of operands
+  // (in *unsigned* integer arithmetics !)
+  bool carry = fraction + phi < max(fraction, phi);
+  ret = result + (carry ? uint64_t(1) : uint64_t(0));
+}
+
+template <typename GenType>
+DI void uniformInt_bounded_32(uint32_t& ret, uint32_t bound, GenType gen)
+{
+  // same implementation as above except we adapt it to 32-bit numbers
+  // this means there is slightly more bias (probability of correct termination
+  // is 1 - 2^-32 here, thus detecting bias would require ~2^64 samples)
+  // for even less bias, one should use the 64-bit implementation.
+  // When paired with PCG, removing the early-out may improve
+  // instruction-level parallelism although this needs to be tested!
+  uint32_t rand;
+  gen.next(rand);
+  uint64_t m_wide;
+  asm("mul.wide.u32 %0, %1, %2;" : "=l"(m_wide) : "r"(rand), "r"(bound));
+  auto result = uint32_t(m_wide >> 32), fraction = uint32_t(m_wide);
+  // we want this to underflow
+  if (fraction <= uint32_t(0) - bound) {
+    ret = result;
+    return;
+  }
+
+  gen.next(rand);
+  // we only calculate the high bits here, since we assume that
+  // bitwidth of output is same as bit-width of random number stream
+  uint32_t phi;
+  asm("mul.hi.u32 %0, %1, %2;" : "=r"(phi) : "r"(rand), "r"(bound));
+  // overflow occurs precisely when addition is smaller than max of operands
+  // (in *unsigned* integer arithmetics !)
+  bool carry = fraction + phi < max(fraction, phi);
+  ret = result + (carry ? uint32_t(1) : uint32_t(0));
+}
+
+template <typename GenType>
+DI void uniformInt_bounded(unsigned int& ret, unsigned int bound, GenType gen)
+{
+  uniformInt_bounded_32((uint32_t&)ret, uint32_t(bound), gen);
+}
+template <typename GenType>
+DI void uniformInt_bounded(unsigned long& ret, unsigned long bound, GenType gen)
+{
+  uniformInt_bounded_32((uint32_t&)ret, uint32_t(bound), gen);
+}
+template <typename GenType>
+DI void uniformInt_bounded(unsigned long long& ret, unsigned long long bound, GenType gen)
+{
+  uniformInt_bounded_64((uint64_t&)ret, uint64_t(bound), gen);
+}
+
 template <typename Type>
 DI void box_muller_transform(Type& val1, Type& val2, Type sigma1, Type mu1, Type sigma2, Type mu2)
 {
@@ -76,6 +151,15 @@ struct Generator {
   DI void next(Type& ret)
   {
     gen.next(ret);
+  }
+
+  template <typename IntOutType, typename IntBoundType>
+  DI void nextInt(IntOutType& ret, IntBoundType bound)
+  {
+    using UintType = typename std::make_unsigned<IntBoundType>::type;
+    UintType uret;
+    uniformInt_bounded(uret, UintType(bound), *this);
+    ret = IntOutType(uret);
   }
 
  private:
@@ -113,6 +197,17 @@ __global__ void rand2Kernel(
     idx += stride;
     if (idx < len) ptr[idx] = (OutType)val2;
   }
+}
+
+// for allowing any transformations given the generator
+template <typename OutType, typename MathType, typename GenType, typename LenType, typename LambdaGen>
+__global__ void randGenKernel(uint64_t seed, uint64_t offset, OutType* ptr, LenType len, LambdaGen randGenOp)
+{
+  LenType tid = (blockIdx.x * blockDim.x) + threadIdx.x;
+  Generator<GenType> gen(seed, (uint64_t)tid, offset);
+  const LenType stride = gridDim.x * blockDim.x;
+  for (LenType idx = tid; idx < len; idx += stride)
+    ptr[idx] = randGenOp(gen, idx);
 }
 
 template <typename Type>
@@ -431,10 +526,18 @@ class RngImpl {
   void uniformInt(IntType* ptr, LenType len, IntType start, IntType end, cudaStream_t stream)
   {
     static_assert(std::is_integral<IntType>::value, "Type for 'uniformInt' can only be integer!");
-    custom_distribution(
+    randGenImpl(
+      offset,
       ptr,
       len,
-      [=] __device__(IntType val, LenType idx) { return (val % (end - start)) + start; },
+      [=] __device__(auto gen, LenType /*idx*/){
+        IntType ret;
+        gen.nextInt(ret, end - start);
+        return start + ret;
+      },
+      NumThreads,
+      nBlocks,
+      type,
       stream);
   }
 
@@ -765,6 +868,40 @@ class RngImpl {
           <<<nBlocks, nThreads, 0, stream>>>(seed, offset, ptr, len, rand2Op);
         break;
       default: ASSERT(false, "rand2Impl: Incorrect generator type! %d", type);
+    };
+    CUDA_CHECK(cudaGetLastError());
+    offset = newOffset;
+  }
+
+  template <typename OutType, typename MathType = OutType, typename LenType = int, typename LambdaGen>
+  void randGenImpl(uint64_t& offset,
+                   OutType* ptr,
+                   LenType len,
+                   LambdaGen randGenOp,
+                   int nThreads,
+                   int nBlocks,
+                   GeneratorType type,
+                   cudaStream_t stream)
+  {
+    if (len <= 0) return;
+    uint64_t seed  = gen();
+    // we do this twice per element since we may generate two numbers per element
+    auto newOffset = _setupSeeds<false, MathType, LenType>(seed, offset, len, nThreads, nBlocks);
+    newOffset = _setupSeeds<false, MathType, LenType>(seed, newOffset, len, nThreads, nBlocks);
+    switch (type) {
+      case GenPhilox:
+        detail::randGenKernel<OutType, MathType, detail::PhiloxGenerator, LenType, LambdaGen>
+          <<<nBlocks, nThreads, 0, stream>>>(seed, offset, ptr, len, randGenOp);
+        break;
+      case GenTaps:
+        detail::randGenKernel<OutType, MathType, detail::TapsGenerator, LenType, LambdaGen>
+          <<<nBlocks, nThreads, 0, stream>>>(seed, offset, ptr, len, randGenOp);
+        break;
+      case GenKiss99:
+        detail::randGenKernel<OutType, MathType, detail::Kiss99Generator, LenType, LambdaGen>
+          <<<nBlocks, nThreads, 0, stream>>>(seed, offset, ptr, len, randGenOp);
+        break;
+      default: ASSERT(false, "randGenImpl: Incorrect generator type! %d", type);
     };
     CUDA_CHECK(cudaGetLastError());
     offset = newOffset;
